@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcvasp"
+version = "0.3.0"
+description = "ASE workflows for constant-potential VASPsol++ calculations"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["ase>=3.22.1", "numpy>=1.21"]
+
+[project.urls]
+Repository = "https://github.com/dfcheng1202/gcvasp"
+
+[tool.setuptools.packages.find]
+include = ["gcvasp*"]
