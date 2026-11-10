@@ -264,7 +264,7 @@ class CPVasp(Vasp):
                     potentiostat_capacitance_e_per_v=self._capacitance,
                     potential_reference_id=self.potential_reference_id,
                     ase_version=ase.__version__, vasp_version=self.version,
-                    gcvasp_version="0.3.0", cpvasp_version="0.3.0",
+                    gcvasp_version="0.4.0", cpvasp_version="0.3.0",
                     outcar_sha256=hashlib.sha256(output).hexdigest(),
                     source_directory=str(Path(self.directory).resolve()),
                     nelect_initial_guess=self.float_params.get("nelect"),

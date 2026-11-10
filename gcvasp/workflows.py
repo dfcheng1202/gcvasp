@@ -96,62 +96,96 @@ def path_coordinate(images, mask=None):
 
 class _ParallelBand(NEB):
     """Prefetch independent SCFs with propagated exceptions, then use ASE NEB."""
-    def __init__(self, images, workers, **kwargs):
+    def __init__(self, images, workers, move_endpoints=False, **kwargs):
         super().__init__(images, parallel=False, **kwargs)
         self.workers = workers
+        self.move_endpoints = move_endpoints
+
+    def __len__(self):
+        return self.nimages * self.natoms if self.move_endpoints else super().__len__()
+
+    def get_positions(self):
+        if self.move_endpoints:
+            return np.concatenate([image.get_positions() for image in self.images])
+        return super().get_positions()
+
+    def set_positions(self, positions):
+        if self.move_endpoints:
+            for image, pos in zip(self.images, positions.reshape(self.nimages, self.natoms, 3)):
+                image.set_positions(pos)
+        else:
+            super().set_positions(positions)
 
     def get_forces(self):
         if self.workers > 1:
             with ThreadPoolExecutor(max_workers=self.workers) as pool:
                 list(pool.map(lambda image: image.get_forces(), self.images))
-        return super().get_forces()
+        interior = super().get_forces()
+        if self.move_endpoints:
+            # No endpoint springs or tangent projection: endpoints minimize Omega.
+            return np.concatenate([self.images[0].get_forces(), interior,
+                                   self.images[-1].get_forces()])
+        return interior
 
 
 def cineb(initial, final, calculator_factory, directory="neb", n_images=6,
           band=None, relax_endpoints=True, endpoint_fmax=0.02, endpoint_steps=500,
           pre_fmax=0.05, fmax=0.03, pre_steps=150, steps=350, spring=0.1,
-          workers=1, resume=False, reaction_mask=None, keep_wavecar=False):
+          workers=1, resume=False, reaction_mask=None, keep_wavecar=False,
+          endpoint_mode=None):
     """Ordinary CP-NEB then CP-CI-NEB, with extxyz band checkpoints.
 
     factory(work_directory, image_index) returns one independent calculator.
     band is an optional complete initial band (including endpoints), e.g. the
     previous potential's path. All energies/forces are recalculated at this U.
-    Endpoints are always checked against endpoint_fmax, including on resume.
+    endpoint_mode='joint' moves endpoints with physical forces in the same
+    FIRE step as the interior band; pre_fmax/fmax apply to every image.
+    'separate' relaxes endpoints first; 'fixed' requires stationary endpoints.
+    None preserves the legacy relax_endpoints=True/False behavior.
     WAVECARs, including endpoints, are kept until the full CI-NEB succeeds.
     """
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     if n_images < 1 or workers < 1:
         raise ValueError("n_images and workers must be positive")
+    if endpoint_mode is None:
+        endpoint_mode = "separate" if relax_endpoints else "fixed"
+    if endpoint_mode not in ("joint", "separate", "fixed"):
+        raise ValueError("endpoint_mode must be 'joint', 'separate', or 'fixed'")
+    joint = endpoint_mode == "joint"
     latest = root / "latest_band.extxyz"
     if latest.exists() and not resume:
         raise FileExistsError("Use resume=True or choose a new NEB directory")
     initial, final = initial.copy(), final.copy()
     check_identity(final, initial)
-    endpoints = []
-    for index, atoms in ((0, initial), (n_images + 1, final)):
-        atoms.info.update(image_index=index, endpoint="IS" if index == 0 else "FS")
-        work = root / ("image_%02d" % index)
-        calc = calculator_factory(work / "vasp", index)
-        if relax_endpoints:
-            atoms = relax(atoms, calc, directory=work, fmax=endpoint_fmax,
-                          steps=endpoint_steps, resume=resume, keep_wavecar=True)
-        else:
-            atoms.calc = calc
-            if np.linalg.norm(atoms.get_forces(), axis=1).max() >= endpoint_fmax:
-                raise RuntimeError("Endpoint is not stationary at the target potential")
-        endpoints.append(atoms)
     resumed = latest.exists()
     if resumed:
         images = read_restart(latest, index=":")
+        saved_mode = images[0].info.get("endpoint_mode")
+        if (saved_mode is not None and saved_mode != endpoint_mode) or (saved_mode is None and joint):
+            raise ValueError("NEB endpoint mode changed; use a new directory")
     elif band is not None:
         images = [image.copy() for image in band]
     else:
-        images = [endpoints[0].copy() for _ in range(n_images + 1)] + [endpoints[1].copy()]
+        images = [initial.copy() for _ in range(n_images + 1)] + [final.copy()]
     if len(images) != n_images + 2:
         raise ValueError("Band must contain n_images + 2 frames")
     for image in images:
         check_identity(image, initial)
+    endpoints = []
+    endpoint_atoms = (images[0], images[-1]) if resumed and joint else (initial, final)
+    for index, atoms in zip((0, n_images + 1), endpoint_atoms):
+        atoms.info.update(image_index=index, endpoint="IS" if index == 0 else "FS")
+        work = root / ("image_%02d" % index)
+        calc = calculator_factory(work / "vasp", index)
+        if endpoint_mode == "separate":
+            atoms = relax(atoms, calc, directory=work, fmax=endpoint_fmax,
+                          steps=endpoint_steps, resume=resume, keep_wavecar=True)
+        else:
+            atoms.calc = calc
+            if not joint and np.linalg.norm(atoms.get_forces(), axis=1).max() >= endpoint_fmax:
+                raise RuntimeError("Endpoint is not stationary at the target potential")
+        endpoints.append(atoms)
     images[0], images[-1] = endpoints
     if not resumed and band is None:
         NEB(images, method="improvedtangent").interpolate(method="idpp", mic=True, apply_constraint=True)
@@ -169,14 +203,20 @@ def cineb(initial, final, calculator_factory, directory="neb", n_images=6,
         offset = int(images[1].info.get("phase_step", 0)) if completed_phase == phase else 0
         for image in images:
             image.info["cp_stage"] = phase
-        neb = _ParallelBand(images, workers=workers, climb=climb, k=spring, method="improvedtangent")
+        neb = _ParallelBand(images, workers=workers, move_endpoints=joint,
+                            climb=climb, k=spring, method="improvedtangent")
         opt = FIRE(neb, logfile=str(root / (phase + ".log")), dt=0.05, maxstep=0.1)
         last_saved = [-1]
 
         def record():
-            forces = neb.get_forces().reshape(n_images, len(initial), 3)
+            forces = neb.get_forces().reshape(-1, len(initial), 3)
             residual = float(np.linalg.norm(forces, axis=2).max())
+            interior_forces = forces[1:-1] if joint else forces
+            endpoint_residual = max(float(np.linalg.norm(image.get_forces(), axis=1).max())
+                                    for image in (images[0], images[-1]))
             energies = [image.get_potential_energy() for image in images]
+            if not np.isfinite(forces).all() or not np.isfinite(energies).all():
+                raise RuntimeError("Nonfinite NEB forces/energies; inspect band geometry and checkpoint")
             coordinate = path_coordinate(images, reaction_mask)
             frames = []
             for index, image in enumerate(images):
@@ -185,10 +225,15 @@ def cineb(initial, final, calculator_factory, directory="neb", n_images=6,
                                  reaction_coordinate=float(coordinate[index]),
                                  relative_grand_potential_ev=energies[index] - energies[0],
                                  neb_residual_ev_per_a=residual,
+                                 interior_residual_ev_per_a=float(np.linalg.norm(interior_forces, axis=2).max()),
+                                 endpoint_residual_ev_per_a=endpoint_residual,
+                                 endpoint_mode=endpoint_mode,
                                  numerical_converged=residual < threshold,
                                  label_eligibility="pending_branch_image_resolution_and_size_qc")
                 frame.set_array("neb_forces", np.zeros((len(image), 3)) if index in (0, len(images)-1)
-                                else forces[index - 1].copy())
+                                else interior_forces[index - 1].copy())
+                if joint:
+                    frame.set_array("optimization_forces", forces[index].copy())
                 frames.append(frame)
             if opt.nsteps != last_saved[0]:
                 write_frames(root / "bands.extxyz", frames, append=True)

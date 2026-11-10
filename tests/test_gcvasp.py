@@ -198,7 +198,7 @@ class GCVaspTests(unittest.TestCase):
                 self.assertAlmostEqual(frames[-1].info["grand_potential_zero_ev"], omega+.01, places=8)
                 self.assertEqual(frames[-1].get_forces(apply_constraint=False)[0, 0], 2.)
                 self.assertEqual(frames[-1].info["electron_control"], "external_fixed_geometry")
-                self.assertEqual(frames[-1].info["gcvasp_version"], "0.3.0")
+                self.assertEqual(frames[-1].info["gcvasp_version"], "0.4.0")
                 self.assertEqual(frames[-1].info["cpvasp_version"], "0.3.0")
                 self.assertEqual(frames[-1].info["charge_iterations"], 3)
                 self.assertEqual(frames[-1].info["charge_updates"], 2)

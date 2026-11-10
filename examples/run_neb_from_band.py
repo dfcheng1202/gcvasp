@@ -7,7 +7,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from gcvasp import CPVasp, cineb, read_restart
+from gcvasp import CPVasp, cineb, dimer_from_neb, read_restart
 from gcvasp.io import dumps
 
 # Edit this value in each of the four job directories --------------------
@@ -44,6 +44,8 @@ CI_NEB_FMAX = 0.05
 ENDPOINT_STEPS = 400
 PRE_NEB_STEPS = 200
 CI_NEB_STEPS = 400
+ENDPOINT_MODE = "joint"        # no separate IS/FS relaxation
+RUN_DIMER = False              # optionally refine the internal maximum afterward
 # -----------------------------------------------------------------------
 
 
@@ -56,7 +58,8 @@ def load_band(mu_e):
         parent = dict(atoms.info)
         atoms.calc = None
         # Retain UIDs, masks, roles and restored constraints; discard old labels.
-        for name in ("forces", "neb_forces", "bias_forces", "propagation_forces", "momenta"):
+        for name in ("forces", "neb_forces", "optimization_forces", "dimer_forces",
+                     "dimer_mode", "bias_forces", "propagation_forces", "momenta"):
             atoms.arrays.pop(name, None)
         atoms.info = dict(
             parent_frame_info_json=dumps(parent),
@@ -87,17 +90,20 @@ def main():
 
     print(f"U = {U_SHE_V:+.2f} V vs SHE; target mu_e = {mu_e:.2f} eV", flush=True)
     print(f"Input: {INPUT}; images: {len(band)}; output: {OUTPUT}", flush=True)
-    # Reoptimize both endpoints, retain all internal images, then NEB -> CI.
+    # Joint mode moves endpoints with physical forces and interior images with NEB forces.
     # CPVasp uses EFERMI_REF=0 internally and adjusts NELECT to mu_e above.
     cineb(
         band[0], band[-1], calculator, directory=OUTPUT,
-        n_images=len(band) - 2, band=band, relax_endpoints=True,
+        n_images=len(band) - 2, band=band, endpoint_mode=ENDPOINT_MODE,
         endpoint_fmax=ENDPOINT_FMAX, endpoint_steps=ENDPOINT_STEPS,
         pre_fmax=PRE_NEB_FMAX, fmax=CI_NEB_FMAX,
         pre_steps=PRE_NEB_STEPS, steps=CI_NEB_STEPS,
         workers=WORKERS, resume=RESUME,
     )
     print("CP-CI-NEB complete:", OUTPUT / "final.extxyz", flush=True)
+    if RUN_DIMER:
+        dimer_from_neb(OUTPUT / "final.extxyz", calculator, directory=HERE / "dimer",
+                       fmax=0.03, steps=200, resume=RESUME)
 
 
 if __name__ == "__main__":

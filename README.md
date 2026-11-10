@@ -3,7 +3,8 @@
 Small ASE workflows for constant-potential calculations with VASPsol++:
 
 - Geometry optimization.
-- NEB followed by climbing-image NEB.
+- NEB followed by climbing-image NEB, including joint endpoint optimization.
+- Constant-potential dimer refinement seeded from a NEB band.
 - Born-Oppenheimer MD with Langevin or NVE dynamics.
 - Slow growth with a moving harmonic restraint.
 
@@ -58,7 +59,7 @@ reference. With a compatible SHE reference, use
 The value -4.57 eV in the VASPsol++ documentation belongs to its stated
 BEEF-vdW setup; calibrate the reference for the functional and interface used.
 
-The editable examples cover GO, NEB, MD, and slow growth. Copy the relevant
+The editable examples cover GO, NEB, dimer, MD, and slow growth. Copy the relevant
 script together with `examples/settings.py` into a calculation directory and
 edit the input filenames and settings before running.
 
@@ -123,10 +124,29 @@ def factory(directory, image_index=0):
                   encut=400, kpts=(3, 3, 1))
 
 cineb(band[0], band[-1], factory, directory="neb",
-      n_images=len(band)-2, band=band, resume=True)
+      n_images=len(band)-2, band=band, endpoint_mode="joint", resume=True)
 ```
 
-Both endpoints are first relaxed at the target potential and then held fixed.
+Choose how to treat the endpoints:
+
+| `endpoint_mode` | Endpoint treatment |
+| --- | --- |
+| `"joint"` | Update endpoints and internal images in the same FIRE step; no preliminary IS/FS optimization |
+| `"separate"` | Relax endpoints first, then hold them fixed during NEB |
+| `"fixed"` | Keep supplied endpoints fixed; require their forces below `endpoint_fmax` |
+
+The API default retains the old behavior: omitted `endpoint_mode` maps
+`relax_endpoints=True` to `"separate"`, and False to `"fixed"`. The updated
+examples explicitly select `"joint"`.
+
+Joint endpoints use constrained physical CP forces, without springs or tangent
+projection. Internal images retain the usual NEB/CI-NEB forces; only an internal
+image can climb. A single FIRE optimizer moves the complete band, and convergence
+requires both endpoint physical forces and internal NEB forces below the phase's
+`pre_fmax` or `fmax`. `endpoint_fmax` and `endpoint_steps` apply only to the other
+modes. Joint optimization allows endpoint basins to change; inspect the final
+reactant/product structures and band connectivity.
+
 All internal images are optimized as a coupled band, first with ordinary NEB
 and then with CI-NEB. Providing `band` preserves its internal geometries;
 without a band, the workflow generates IDPP images. Internal images are not
@@ -139,11 +159,62 @@ Place it beside a complete `initial.extxyz` band, edit `U_SHE_V`, and set
 counts as initial guesses, clears old result labels, and recomputes the band
 at the new potential. Use a separate output directory for each potential.
 Only one final band should be supplied, rather than concatenated NEB history.
-Endpoint displacements are not automatically propagated into internal images.
+Joint mode uses the evolving endpoints when computing each new band tangent
+and spring force. It does not explicitly interpolate endpoint displacements
+into internal images or guarantee that an initially discontinuous band is repaired.
 
 `workers=1` evaluates images serially. For multiple workers, divide the allocated
 MPI ranks among their VASP commands. Actual speedups depend on the system and
 scheduler and must be measured on the calculation host.
+
+## Dimer from CI-NEB
+
+```python
+from gcvasp import dimer_from_neb
+
+# factory has the same signature and target mu_e as in the NEB example above.
+ts = dimer_from_neb("neb/final.extxyz", factory, directory="dimer",
+                    fmax=0.03, steps=200, dimer_separation=0.01, resume=True)
+```
+
+`examples/run_dimer.py` runs this stage independently. The NEB examples also
+provide `RUN_DIMER=True` to run it after CI convergence. A rough
+`neb/latest_band.extxyz` is a valid seed: a completely converged NEB is not
+required. Supply one complete band, not concatenated `bands.extxyz` history.
+
+Automatic selection uses the highest-energy image only if it is internal.
+If an endpoint is highest, pass an explicit, zero-based `image_index` to choose
+an internal candidate. The mode is an energy-weighted tangent from its two
+neighbors, with MIC displacements and the input constraints applied. Neither
+this choice nor a numerically converged NEB proves that the seed is a TS.
+
+To inspect or retain the seed before running:
+
+```python
+from gcvasp import dimer_guess, dimer, write_frames
+
+seed = dimer_guess("neb/latest_band.extxyz", image_index=3)
+write_frames("dimer_seed.extxyz", seed)
+dimer(seed, factory("dimer/vasp", 3), directory="dimer", resume=True)
+```
+
+ASE supplies dimer rotation and translation. Every actual center, rotational,
+and translational-probe force evaluation goes through CPVasp electron
+equilibration at the same target mu_e. `use_central_forces=True` uses ASE's
+reflection estimate for the opposite dimer endpoint; False explicitly evaluates
+both endpoints. The default center-to-probe separation is 0.01 Angstrom.
+Curvature depends on force noise, so check SCF/potential tolerance and separation
+on representative DFT cases before accepting saddle results.
+
+`initial.extxyz` saves the seed and direction. Center frames retain physical
+Omega/forces/Fermi/Ne, plus `dimer_mode`, `dimer_forces`, physical force maximum,
+and `dimer_curvature_ev_per_a2`. A center's labels are cached before probe
+calculations, so displaced-point charge or energy cannot label the center.
+`vasp/evaluations.extxyz` includes all actual SCF trials, with
+`dimer_evaluation="center"` or `"displaced"`. Standard `forces` remain raw
+physical forces. Numerical success requires small physical and search forces
+and negative curvature; `saddle_order_verified=False` remains until an independent
+mode-count/connectivity check. The return value has cached physical center results.
 
 ## MD and slow growth
 
@@ -177,15 +248,21 @@ and grand-canonical energies, physical forces, electronic-search history,
 protocol and PAW hashes, software versions, atom UIDs, and constraints.
 MD checkpoints additionally retain momenta and RNG state.
 
-Standard `forces` are raw physical forces before fixed-atom, NEB, or bias
-modifications. `neb_forces`, `bias_forces`, and `propagation_forces` are separate
-arrays. Intermediate charge trials are marked fixed-Ne; electronically and
+Standard `forces` are raw physical forces before fixed-atom, NEB, dimer, or bias
+modifications. `neb_forces`, `optimization_forces` (joint band), `dimer_forces`,
+`bias_forces`, and `propagation_forces` are separate arrays.
+Intermediate charge trials are marked fixed-Ne; electronically and
 potential-converged frames are marked electron-grand-canonical.
 The cell charge is not an atomic charge partitioning.
 
 Use `resume=True` with the same input, potential, and protocol. Step budgets
 are totals including completed work; NEB has separate ordinary and CI budgets.
 GO and NEB restore positions and electronic guesses but restart FIRE state.
+Joint NEB restores the endpoint positions from the saved band as well; changing
+endpoint mode requires a new output directory. To switch an existing run to
+joint mode, use its `latest_band.extxyz` as `band` in a new directory.
+Dimer restores center positions and its mode from `latest.extxyz` and restarts
+the translation optimizer; geometry, potential, and dimer protocol must match.
 MD restores momenta and RNG state. Failed records are preserved.
 
 The electronic protocol retains the legacy `cpvasp_version="0.2.0"` tag for
@@ -196,7 +273,7 @@ version, settings, potential, and command. Existing scripts should change their
 imports to `gcvasp` when switching distributions.
 
 WAVECAR is overwritten as a working cache during a calculation. It is removed
-only after successful final output for the complete GO, CI-NEB, MD, or
+only after successful final output for the complete GO, CI-NEB, dimer, MD, or
 slow-growth task. Failures and interruptions retain it; NEB endpoint caches
 remain until the entire band succeeds. Set `keep_wavecar=True` to retain it.
 Direct calculator users can call `calculator.cleanup_wavecar()` at completion.
@@ -209,7 +286,8 @@ python -m unittest discover -s tests -v
 
 Tests use analytic potentials, synthetic OUTCAR text, and mock VASP calls.
 They cover electron control, energy/force consistency, physical labels, NEB,
-MD, slow growth, restart, failures, and WAVECAR lifetime. These checks do not
+joint endpoints, dimer modes/center labels, MD, slow growth, restart, failures,
+and WAVECAR lifetime. These checks do not
 establish a physical barrier, finite-temperature activation free energy, or
 HPC performance result. No real calculation data or licensed VASP files are
 included.
@@ -220,3 +298,5 @@ included.
 - [Native charge updates and static calculations](https://github.com/VASPsol/VASPsol/issues/6#issuecomment-2181870689).
 - [VASP WAVECAR documentation](https://vasp.at/wiki/WAVECAR).
 - [EChO](https://github.com/zishengz/echo/tree/9363a04c2cb52c3e0f4438a369a7846b09ac8cac), which inspired the workflow; this package was implemented independently.
+- [ASE NEB documentation](https://docs.ase-lib.org/ase/neb.html).
+- [ASE dimer documentation](https://docs.ase-lib.org/ase/dimer.html).
